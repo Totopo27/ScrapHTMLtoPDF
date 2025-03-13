@@ -6,6 +6,7 @@ import pdfkit
 from PyPDF2 import PdfMerger
 import re
 import logging
+import json
 
 # Configuración de logs
 logging.basicConfig(
@@ -169,6 +170,95 @@ def extract_urls_by_crawling(seed_url):
     # Ordenamos por la estructura de carpetas y nombres para mantener cierta lógica
     return sorted(all_urls)
 
+def is_json(text):
+    """
+    Verifica si una cadena de texto es un JSON válido.
+    """
+    try:
+        # Intentar analizar como JSON
+        json.loads(text)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+def format_json(text):
+    """
+    Intenta formatear correctamente el JSON si es válido.
+    """
+    try:
+        # Analizar y reformatear JSON con indentación
+        parsed_json = json.loads(text)
+        formatted_json = json.dumps(parsed_json, indent=4)
+        return formatted_json
+    except (ValueError, TypeError):
+        # Si no es un JSON válido, devolver el texto original
+        return text
+
+def extract_json_examples(html_content):
+    """
+    Busca y extrae ejemplos de JSON del contenido HTML para procesarlos por separado.
+    Evita duplicados verificando el contenido normalizado.
+    """
+    soup = BeautifulSoup(html_content, "html.parser")
+    examples = []
+    processed_texts = set()  # Conjunto para almacenar textos ya procesados
+    
+    # Identificar contenedores comunes de ejemplos de código/JSON
+    selectors = [
+        'pre', 'code', '.example', '.code-example', '.json-example', 
+        '.request-example', '.response-example', '.curl-example'
+    ]
+    
+    for selector in selectors:
+        elements = soup.select(selector)
+        for element in elements:
+            text = element.get_text(strip=True)
+            
+            # Verificar si el texto parece un objeto JSON (comienza y termina con llaves)
+            if (text.strip().startswith('{') and text.strip().endswith('}')) or \
+               (text.strip().startswith('[') and text.strip().endswith(']')):
+                
+                # Normalizar el texto para evitar duplicados por espacios/formato
+                normalized_text = ''.join(text.split())
+                
+                # Verificar si ya hemos procesado este texto
+                if normalized_text not in processed_texts:
+                    processed_texts.add(normalized_text)
+                    examples.append(element)
+    
+    return examples
+
+def preserve_json_format(element):
+    """
+    Preserva el formato de los elementos JSON para mostrarlos correctamente en el PDF.
+    """
+    text = element.get_text()
+    
+    # Intentar detectar y formatear JSON
+    if (text.strip().startswith('{') and text.strip().endswith('}')) or \
+       (text.strip().startswith('[') and text.strip().endswith(']')):
+        try:
+            # Primero limpiar el texto de posibles marcas HTML o caracteres especiales
+            cleaned_text = re.sub(r'[\n\r\t]+', ' ', text)
+            cleaned_text = re.sub(r'\s{2,}', ' ', cleaned_text)
+            
+            # Intentar formatear como JSON
+            formatted_json = format_json(cleaned_text)
+            
+            # Crear un nuevo elemento pre con el JSON formateado correctamente
+            new_pre = BeautifulSoup().new_tag('pre')
+            new_pre['style'] = "white-space: pre-wrap; font-family: monospace; background-color: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto;"
+            new_pre.string = formatted_json
+            
+            # Reemplazar el elemento original con el nuevo
+            element.replace_with(new_pre)
+            return True
+        except:
+            # Si hay algún error en el formateo, mantener el elemento original
+            return False
+    
+    return False
+
 def extract_code_block_content(element):
     """
     Extrae el contenido de texto de un bloque de código, 
@@ -176,15 +266,42 @@ def extract_code_block_content(element):
     """
     # Si el elemento es un pre o code directamente, obtener su texto
     if element.name in ['pre', 'code']:
-        return element.get_text(strip=True)
+        raw_text = element.get_text()
+        # Verificar si parece JSON y formatearlo si es posible
+        if (raw_text.strip().startswith('{') and raw_text.strip().endswith('}')) or \
+           (raw_text.strip().startswith('[') and raw_text.strip().endswith(']')):
+            try:
+                return format_json(raw_text.strip())
+            except:
+                pass
+        return raw_text
     
     # Buscar elementos pre o code dentro del contenedor
     code_elements = element.find_all(['pre', 'code'])
     if code_elements:
-        return "\n\n".join([code.get_text(strip=True) for code in code_elements])
+        contents = []
+        for code in code_elements:
+            text = code.get_text()
+            # Verificar si parece JSON y formatearlo si es posible
+            if (text.strip().startswith('{') and text.strip().endswith('}')) or \
+               (text.strip().startswith('[') and text.strip().endswith(']')):
+                try:
+                    contents.append(format_json(text.strip()))
+                    continue
+                except:
+                    pass
+            contents.append(text)
+        return "\n\n".join(contents)
     
     # Buscar texto dentro de divs que pueden contener código
-    code_text = element.get_text(strip=True)
+    code_text = element.get_text()
+    # Verificar si parece JSON y formatearlo
+    if (code_text.strip().startswith('{') and code_text.strip().endswith('}')) or \
+       (code_text.strip().startswith('[') and code_text.strip().endswith(']')):
+        try:
+            return format_json(code_text.strip())
+        except:
+            pass
     return code_text
 
 def extract_table_content(table):
@@ -219,7 +336,36 @@ def process_content_containers(soup):
     Procesa bloques de código, tablas y otros contenedores con barras de navegación
     para que se muestren correctamente en el PDF.
     """
-    # 1. Procesar bloques de código
+    # 1. Identificar y eliminar ejemplos duplicados
+    # Buscar elementos específicos que pueden contener ejemplos duplicados
+    request_examples = soup.find_all(string=re.compile(r'request example', re.IGNORECASE))
+    for example_text in request_examples:
+        parent = example_text.parent
+        if parent:
+            # Buscar el siguiente elemento que contiene el ejemplo
+            next_siblings = list(parent.next_siblings)
+            json_blocks = []
+            
+            # Recopilar bloques JSON consecutivos
+            for sibling in next_siblings:
+                if sibling.name in ['pre', 'code'] or (hasattr(sibling, 'get_text') and 
+                   sibling.get_text().strip().startswith('{')):
+                    json_blocks.append(sibling)
+                elif sibling.name and sibling.name not in ['br', 'span'] and not (
+                     hasattr(sibling, 'get_text') and not sibling.get_text().strip()):
+                    break
+            
+            # Si hay múltiples bloques JSON, mantener solo el primero
+            if len(json_blocks) > 1:
+                for block in json_blocks[1:]:
+                    block.decompose()
+    
+    # 2. Procesar ejemplos de JSON para preservar su formato
+    json_examples = extract_json_examples(str(soup))
+    for element in json_examples:
+        preserve_json_format(element)
+    
+    # 2. Procesar bloques de código
     # Patrones comunes para identificar contenedores de código
     code_containers = []
     
@@ -249,7 +395,7 @@ def process_content_containers(soup):
     tab_containers = soup.find_all('div', class_=lambda x: x and ('tab' in x.lower() or 'example' in x.lower()))
     code_containers.extend(tab_containers)
     
-    # 2. Procesar tablas y contenedores de parámetros
+    # 3. Procesar tablas y contenedores de parámetros
     table_containers = []
     
     # Buscar tablas directamente
@@ -276,17 +422,25 @@ def process_content_containers(soup):
     nav_containers = soup.find_all(['div', 'section'], class_=lambda x: x and any(term in (x.lower() if x else "") for term in ['scroll', 'nav', 'slider', 'container', 'params', 'parameter']))
     table_containers.extend(nav_containers)
     
-    # 3. Procesar los contenedores de código
+    # 4. Procesar los contenedores de código (que no han sido procesados como JSON)
     for container in code_containers:
         try:
-            # Verificar si no es parte de un contenedor de tabla ya procesado
-            if any(container in tc for tc in table_containers):
+            # Verificar si no es parte de un contenedor de tabla ya procesado o un ejemplo JSON ya procesado
+            if any(container in tc for tc in table_containers) or any(container == ex for ex in json_examples):
                 continue
                 
             # Extraer el texto del código
             code_text = extract_code_block_content(container)
             
             if code_text and len(code_text) > 10:  # Filtrar bloques muy pequeños
+                # Intentar detectar si es un JSON y formatearlo
+                if (code_text.strip().startswith('{') and code_text.strip().endswith('}')) or \
+                   (code_text.strip().startswith('[') and code_text.strip().endswith(']')):
+                    try:
+                        code_text = format_json(code_text.strip())
+                    except:
+                        pass
+                
                 # Crear un nuevo elemento pre para sustituir el contenedor
                 new_pre = soup.new_tag('pre', style="white-space: pre-wrap; word-wrap: break-word; background-color: #f5f5f5; padding: 10px; border-radius: 4px; font-family: monospace;")
                 new_pre.string = code_text
@@ -296,7 +450,7 @@ def process_content_containers(soup):
         except Exception as e:
             logger.warning(f"No se pudo procesar un bloque de código: {str(e)}")
     
-    # 4. Procesar los contenedores de tablas
+    # 5. Procesar los contenedores de tablas
     for container in table_containers:
         try:
             # Buscar tablas dentro del contenedor
@@ -354,8 +508,23 @@ def process_html(url):
         for element in soup(["header", "footer", "nav", "script", "style"]):
             element.decompose()
         
+        # Identificar patrón de duplicación específico de la documentación de Bitunix
+        # Buscar patrones como 'curl-X'GET'--...' duplicados
+        curl_examples = soup.find_all(string=lambda text: text and text.strip().startswith('curl-X'))
+        processed_curls = set()
+        
+        for curl_text in curl_examples:
+            # Normalizar el texto del curl para comparar
+            normalized = re.sub(r'\s+', ' ', curl_text.strip())
+            if normalized in processed_curls:
+                # Es un duplicado, eliminar este nodo
+                if curl_text.parent:
+                    curl_text.parent.decompose()
+            else:
+                processed_curls.add(normalized)
+        
         # Procesar los bloques de código y tablas especiales
-        process_content_containers(soup)
+        soup = process_content_containers(soup)
         
         # Convertir rutas relativas a absolutas
         base_url = url.rsplit("/", 1)[0] + "/"
@@ -365,7 +534,7 @@ def process_html(url):
                     tag[attr] = urljoin(base_url, tag[attr])
         
         # Mejorar la presentación general del documento
-        # Agregar estilo para mejorar la legibilidad
+        # Agregar estilo para mejorar la legibilidad y preservar formato de código
         style_tag = soup.new_tag('style')
         style_tag.string = """
             body { font-family: Arial, sans-serif; line-height: 1.5; }
@@ -373,8 +542,16 @@ def process_html(url):
             th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
             th { background-color: #f2f2f2; }
             h1, h2, h3, h4, h5, h6 { margin-top: 20px; }
-            pre { background-color: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; }
-            code { font-family: monospace; }
+            pre { background-color: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; }
+            code { font-family: monospace; background-color: #f5f5f5; padding: 2px 4px; }
+            .code-example, .request-example, .response-example { 
+                background-color: #f5f5f5; 
+                padding: 10px; 
+                border-radius: 4px; 
+                margin: 10px 0;
+                font-family: monospace;
+                white-space: pre-wrap;
+            }
         """
         soup.head.append(style_tag) if soup.head else soup.append(style_tag)
         
@@ -427,6 +604,8 @@ def convert_to_pdf(url_list):
                         "dpi": "300",
                         # Ajuste para asegurar que se muestren todos los contenidos
                         "javascript-delay": "1000",
+                        # Opciones para preservar formato de código
+                        "enable-smart-shrinking": "",
                     }
                 )
                 pdf_files.append(output_path)
